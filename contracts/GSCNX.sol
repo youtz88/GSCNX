@@ -11,9 +11,9 @@ interface IPancakeV3Factory {
 }
 
 /**
- * @title GSCNX Token (Pro Version)
+ * @title GSCNX Token
  * @dev Standard ERC20 token with advanced liquidity infrastructure compatibility.
- * Optimized for PancakeSwap Infinity (V4) with ceiling division fees and robust ownership security.
+ * Designed to support multi-protocol routing including PancakeSwap V2, V3, and Infinity (V4).
  */
 contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
 
@@ -26,7 +26,7 @@ contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
     mapping(address => bool) public automatedMarketMakerPairs;
 
     /// @notice Whitelist for advanced liquidity routers (e.g., V4 Vaults, Cross-chain bridges).
-    /// @dev Addresses marked 'true' bypass standard limits and fees.
+    /// @dev Addresses marked 'true' bypass standard limits and fees to ensure protocol compatibility.
     mapping(address => bool) public isLiquidityRouter;
 
     // --- Events ---
@@ -36,8 +36,9 @@ contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
     event LiquidityRouterStatusUpdated(address indexed router, bool status);
     event InitialBuyFeeUpdated(uint256 newFee);
     
-    // [Optimization 1] Added event: Anti-clamp status change
+    // [Optimization 1] Added event: Anti-clamp status change & Purchase limit update event
     event AntiSnipeEnabledUpdated(bool enabled);
+    event LimitsUpdated(uint256 maxTxAmount, uint256 maxWallet);
 
     // --- Anti-Bot & Trading Controls ---
 
@@ -61,7 +62,8 @@ contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
     // --- Fee Structure ---
     
     // Final fee rates (Long-term policy)
-    uint256 public constant FINAL_BUY_FEE = 500; // 5%
+    // V3 Buy Fee: 5%, Sell Fee: 0% 
+    uint256 public constant FINAL_BUY_FEE = 500;
     uint256 public constant FINAL_SELL_FEE = 0;   
 
     // Initial fee rates (Launch phase - Adjustable)
@@ -108,6 +110,10 @@ contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
         taxWallet = _taxWallet;
     }
 
+    /**
+     * @dev Toggles the Buy Fee status.
+     * Useful for marketing events or migrating to pure V4 logic.
+     */
     function setBuyTaxEnabled(bool _enabled) external onlyOwner {
         buyTaxEnabled = _enabled;
         emit BuyTaxEnabledUpdated(_enabled);
@@ -123,26 +129,44 @@ contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
         require(_maxWallet >= (TOTAL_SUPPLY * 10) / 1000, "Wallet limit too low");
         maxTxAmount = _maxTx;
         maxWallet = _maxWallet;
+        emit LimitsUpdated(_maxTx, _maxWallet);
     }
 
+    /**
+     * @dev Updates the list of automated market maker pairs.
+     */
     function setAutomatedMarketMakerPair(address pair, bool value) external onlyOwner {
         require(pair != address(0), "Invalid pair address");
         automatedMarketMakerPairs[pair] = value;
         emit SetAutomatedMarketMakerPair(pair, value);
     }
 
+    /**
+     * @dev Configures liquidity router status.
+     * @param _router Address of the router/vault/infrastructure.
+     * @param _status True to exempt from logic, False to treat as normal.
+     * Supports multiple routers (V4 Vault, Market Makers, etc.) simultaneously.
+     */
     function setLiquidityRouter(address _router, bool _status) external onlyOwner {
         require(_router != address(0), "Invalid address");
         isLiquidityRouter[_router] = _status;
         emit LiquidityRouterStatusUpdated(_router, _status);
     }
 
+    /**
+     * @dev Adjusts the initial buy fee during the launch phase.
+     * @param _fee New fee in basis points (e.g., 2000 = 20%).
+     * Safety: Cannot exceed 25% to prevent misuse.
+     */
     function setInitialBuyFee(uint256 _fee) external onlyOwner {
         require(_fee <= 2500, "Safety: Fee exceeds limit"); 
         initialBuyFee = _fee;
         emit InitialBuyFeeUpdated(_fee);
     }
     
+    /**
+     * @dev Helper to quickly cache V3 pools.
+     */
     function cacheV3Pools(address tokenB, uint24[] calldata fees) external onlyOwner {
         for (uint256 i = 0; i < fees.length; i++) {
             address pool = IPancakeV3Factory(FACTORY_V3).getPool(address(this), tokenB, fees[i]);
@@ -160,68 +184,78 @@ contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
         address to,
         uint256 amount
     ) internal override {
+        // Standard check
         if (from == address(0) || to == address(0)) {
             super._update(from, to, amount);
             return;
         }
 
         // 1. Infrastructure Exemption (Priority High)
+        // Bypass logic for designated Liquidity Routers (V4 Vaults, Bridges, etc.)
+        // This prevents interference with flash accounting and internal settlements.
         if (isLiquidityRouter[from] || isLiquidityRouter[to]) {
             super._update(from, to, amount);
             return;
         }
 
-        // 2. Standard Exemptions
+        // 2. Standard Exemptions (Owner, Contract, TaxWallet)
         bool isExempt = (from == owner() || to == owner() || from == address(this) || to == address(this) || from == taxWallet || to == taxWallet);
         if (isExempt) {
             super._update(from, to, amount);
             return;
         }
 
-        if (!tradingActive) {
-            require(automatedMarketMakerPairs[to] || automatedMarketMakerPairs[from], "Trading not active");
-        }
+        // Ensure trading is open
+        require(tradingActive, "Trading not active");
 
         bool isBuy = automatedMarketMakerPairs[from]; 
         uint256 feeAmount = 0;
 
-        if (tradingActive) {
-            // A. Anti-Snipe & Limits
-            if (antiSnipeEnabled) {
-                if (isBuy) {
-                    require(_lastBuyBlock[to] < block.number, "Rate limit: One tx per block");
-                    _lastBuyBlock[to] = block.number;
-
-                    require(amount <= maxTxAmount, "Exceeds maxTxAmount");
-                    require(balanceOf(to) + amount <= maxWallet, "Exceeds maxWallet");
-
-                    if (block.number <= tradingStartBlock + 8) {
-                        require(amount <= maxTxAmount / 5, "Launch protection active");
-                    }
-                } 
-                else if (automatedMarketMakerPairs[to]) { 
-                    require(amount <= maxTxAmount, "Exceeds maxTxAmount");
-                }
+        // -----------------------------------------------------------------
+        // Fee calculation prioritized.This allows subsequent checks to validate against the Net Amount.
+        // Fee Calculation [Optimization: Rounding Up Algorithm]
+        // -----------------------------------------------------------------
+        if (isBuy && buyTaxEnabled) {
+            uint256 currentFeeRate;
+            
+            // Determine rate
+            if (block.timestamp > tradingStartTime + 900) {
+                currentFeeRate = FINAL_BUY_FEE; 
+            } else {
+                currentFeeRate = initialBuyFee; 
             }
 
-            // B. Fee Calculation [Optimization 2: Rounding Up Algorithm]
-            if (isBuy && buyTaxEnabled) {
-                uint256 currentFeeRate;
-                
-                // Determine rate
-                if (block.timestamp > tradingStartTime + 900) {
-                    currentFeeRate = FINAL_BUY_FEE; 
-                } else {
-                    currentFeeRate = initialBuyFee; 
-                }
+            // Math: Ceiling Division (Round Up)
+            // Formula: (amount * fee + 9999) / 10000
+            // This ensures even 1 wei of theoretical fee results in 1 wei actual fee.
+            if (amount > 0 && currentFeeRate > 0) {
+                feeAmount = (amount * currentFeeRate + 9999) / 10000;
+            }
+        } 
 
-                // Math: Ceiling Division (Round Up)
-                // Formula: (amount * fee + 9999) / 10000
-                // This ensures even 1 wei of theoretical fee results in 1 wei actual fee.
-                if (amount > 0 && currentFeeRate > 0) {
-                    feeAmount = (amount * currentFeeRate + 9999) / 10000;
+        // -----------------------------------------------------------------
+        // Anti-Snipe & Limits Protection
+        // Only applies if not interacting with an exempted Router
+        // -----------------------------------------------------------------
+        if (antiSnipeEnabled) {
+            if (isBuy) {
+                require(_lastBuyBlock[to] < block.number, "Rate limit: One tx per block");
+                _lastBuyBlock[to] = block.number;
+
+                require(amount <= maxTxAmount, "Exceeds maxTxAmount");
+                
+                // Optimization: Wallet Limit Check (Net Amount Compliance)
+                // Logic: Balance + (GrossBuy - Fee) <= MaxWallet
+                // Ensures the actual received amount does not breach holding limits.
+                require(balanceOf(to) + (amount - feeAmount) <= maxWallet, "Exceeds maxWallet");
+
+                if (block.number <= tradingStartBlock + 8) {
+                    require(amount <= maxTxAmount / 5, "Launch protection active");
                 }
             } 
+            else if (automatedMarketMakerPairs[to]) { // Sell check
+                require(amount <= maxTxAmount, "Exceeds maxTxAmount");
+            }
         }
 
         if (feeAmount > 0) {
@@ -232,20 +266,12 @@ contract GSCNX is ERC20, ERC20Burnable, ERC20Permit, Ownable {
         }
     }
 
-    /**
-     * @dev Renounce Ownership override.
-     * Prevents renouncing before trading is active to ensure contract is not deadlocked.
-     */
     function renounceOwnership() public override onlyOwner {
         require(tradingActive, "Trading must be active");
         super.renounceOwnership();
     }
 
-    /**
-     * [Optimization 3 Implementation] Overrides transferOwnership.
-     * If newOwner is the zero address, it enforces the same security checks as renounceOwnership.
-     * This prevents bypassing the "renounce" restrictions via a direct "transfer to 0x0".
-     */
+    // [Optimization 3 Implementation] Overrides transferOwnership.
     function transferOwnership(address newOwner) public override onlyOwner {
         if (newOwner == address(0)) {
             require(tradingActive, "Trading must be active");
